@@ -3,7 +3,6 @@ import pandas as pd
 import json
 import plotly.express as px
 import re
-from datetime import datetime
 
 st.header("States Map")
 
@@ -84,69 +83,23 @@ st.info("If you place a Malaysia states GeoJSON at `assets/malaysia_states.geojs
 geojson_file_obj = st.file_uploader("Upload Malaysia states GeoJSON (optional)", type=["geojson","json"], key="gj_upload")
 
 geojson_data = None
+err_message = None
 if geojson_file_obj is not None:
     try:
         geojson_data = json.load(geojson_file_obj)
     except Exception as e:
-        st.warning(f"Uploaded GeoJSON invalid: {e}")
+        err_message = f"Uploaded GeoJSON invalid: {e}"
 
 if geojson_data is None:
     try:
         with open("assets/malaysia_states.geojson", "r", encoding="utf-8") as f:
             geojson_data = json.load(f)
     except Exception as e:
-        st.warning(f"GeoJSON not found/invalid at assets/malaysia_states.geojson ({e}). Showing bar chart fallback.")
+        err_message = f"GeoJSON not found/invalid at assets/malaysia_states.geojson ({e})."
 
-if geojson_data is not None and "features" in geojson_data:
-    # Inspect available property keys
-    prop_keys = sorted({k for feat in geojson_data["features"] for k in feat.get("properties", {}).keys()})
-    st.caption(f"GeoJSON property keys detected: {prop_keys}")
-
-    # Try common feature id keys
-    candidate_keys = ["properties.name", "properties.NAME_1", "properties.state", "properties.negeri"]
-    used_key = None
-    for k in candidate_keys:
-        prop = k.split(".", 1)[1]  # e.g. 'name'
-        if prop in geojson_data["features"][0].get("properties", {}):
-            used_key = k
-            break
-
-    # Optional: harmonize state names to match GeoJSON if needed
-    name_fix = {
-        "Pulau Pinang": "Penang",          # adjust if your GeoJSON uses Penang
-        "W.P. Kuala Lumpur": "Kuala Lumpur",
-        "W.P. Labuan": "Labuan",
-        "W.P. Putrajaya": "Putrajaya",
-    }
-    if "state" in d.columns:
-        d["state"] = d["state"].replace(name_fix)
-
-    if used_key is None:
-        st.warning("Couldn't find a suitable feature id key (tried name/NAME_1/state/negeri). "
-                   "Showing bar chart instead.")
-        index_col = "state" if "state" in d.columns else d.columns[0]
-        d = d.sort_values(metric, ascending=False)
-        st.bar_chart(d.set_index(index_col)[metric])
-    else:
-        try:
-            fig = px.choropleth(
-                d,
-                geojson=geojson_data,
-                featureidkey=used_key,
-                locations="state",
-                color=metric,
-                color_continuous_scale="Viridis",
-                projection="mercator",
-            )
-            fig.update_geos(fitbounds="locations", visible=False)
-            st.plotly_chart(fig, use_container_width=True)
-        except Exception as e:
-            st.warning(f"Choropleth failed ({e}). Showing bar chart instead.")
-            index_col = "state" if "state" in d.columns else d.columns[0]
-            d = d.sort_values(metric, ascending=False)
-            st.bar_chart(d.set_index(index_col)[metric])
-else:
-    # Fallback bar chart
+if geojson_data is None or "features" not in geojson_data:
+    if err_message:
+        st.warning(err_message + " Showing bar chart fallback.")
     index_col = "state" if "state" in d.columns else d.columns[0]
     if metric not in d.columns:
         st.error(f"Metric '{metric}' not found in data columns {list(d.columns)}. "
@@ -154,3 +107,102 @@ else:
         st.stop()
     d = d.sort_values(metric, ascending=False)
     st.bar_chart(d.set_index(index_col)[metric])
+    st.stop()
+
+# Inspect available property keys on the GeoJSON
+prop_keys = sorted({k for feat in geojson_data["features"] for k in feat.get("properties", {}).keys()})
+st.caption(f"GeoJSON property keys detected: {prop_keys}")
+
+# Choose a usable property as feature id (auto-detects shapeName too)
+candidate_props = ["name", "NAME_1", "state", "negeri", "shapeName"]
+used_prop = None
+for p in candidate_props:
+    if p in prop_keys:
+        used_prop = p
+        break
+
+if used_prop is None:
+    st.warning("Couldn't find a suitable feature id key (tried name/NAME_1/state/negeri/shapeName). "
+               "Showing bar chart instead.")
+    index_col = "state" if "state" in d.columns else d.columns[0]
+    d = d.sort_values(metric, ascending=False)
+    st.bar_chart(d.set_index(index_col)[metric])
+    st.stop()
+
+featureidkey = f"properties.{used_prop}"
+
+# ------- Harmonize state names to match the GeoJSON values -------
+def canonicalize(x: str) -> str:
+    s = str(x or "").lower().strip()
+    # normalize common variants
+    s = s.replace("wilayah persekutuan", "wp")
+    s = s.replace("w.p.", "wp").replace("w. p.", "wp")
+    s = s.replace("kuala lumpur", "kuala lumpur")
+    s = s.replace("putrajaya", "putrajaya")
+    s = s.replace("labuan", "labuan")
+    s = s.replace("pulau pinang", "penang")  # normalize both to 'penang'
+    s = s.replace("penang", "penang")
+    s = s.replace(" negeri ", " negeri ")  # keep spacing for other states
+    s = re.sub(r"[^a-z0-9 ]+", " ", s)     # remove punctuation
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+# GeoJSON names set
+gj_names = [feat["properties"].get(used_prop, "") for feat in geojson_data["features"]]
+gj_canon_map = {canonicalize(n): n for n in gj_names if n}
+
+# Map df['state'] -> GeoJSON property names by canonical match + a few manual fixes
+if "state" in d.columns:
+    # manual “nice” fixes (dataframe -> geojson)
+    manual_fix = {
+        "Penang": "Pulau Pinang",
+        "Kuala Lumpur": "W.P. Kuala Lumpur",
+        "Labuan": "W.P. Labuan",
+        "Putrajaya": "W.P. Putrajaya",
+        "Melaka": "Melaka",  # (same)
+        "Negeri Sembilan": "Negeri Sembilan",
+    }
+    # try canonical map first, then manual override if needed
+    mapped_states = []
+    for sname in d["state"].astype(str):
+        canon = canonicalize(sname)
+        target = gj_canon_map.get(canon)
+        if target is None and sname in manual_fix:
+            target = manual_fix[sname]
+        # if still None, keep original value (so mismatches are visible)
+        mapped_states.append(target if target is not None else sname)
+    d["state_mapped"] = mapped_states
+else:
+    d["state_mapped"] = d.iloc[:, 0]  # fallback: first column if 'state' missing
+
+# Warn about any unmatched names
+unmatched = sorted(set(d["state_mapped"]) - set(gj_names))
+if unmatched:
+    st.warning(f"Some states didn’t match GeoJSON names and may not render: {unmatched}")
+
+# ---- Draw choropleth ----
+try:
+    fig = px.choropleth(
+        d,
+        geojson=geojson_data,
+        featureidkey=featureidkey,  # e.g. properties.shapeName
+        locations="state_mapped",   # mapped names to match the GeoJSON
+        color=metric,
+        color_continuous_scale="Viridis",
+        projection="mercator",
+    )
+    fig.update_geos(fitbounds="locations", visible=False)
+    st.plotly_chart(fig, use_container_width=True)
+except Exception as e:
+    st.warning(f"Choropleth failed ({e}). Showing bar chart instead.")
+    index_col = "state" if "state" in d.columns else d.columns[0]
+    d = d.sort_values(metric, ascending=False)
+    st.bar_chart(d.set_index(index_col)[metric])
+
+# Show quick legend of what we matched
+with st.expander("See matched names (data → GeoJSON)"):
+    if "state" in d.columns:
+        show = d[["state", "state_mapped"]].drop_duplicates().sort_values("state")
+        st.dataframe(show, use_container_width=True)
+    else:
+        st.write("No 'state' column found in the data.")
